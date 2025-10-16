@@ -1,0 +1,160 @@
+import serial
+import csv
+import time
+import os
+from datetime import datetime
+import math
+
+# --- Configuration ---
+COM_PORT = 'COM5'
+BAUD_RATE = 115200
+FILE_NAME = r'D:\mpu9250_gps_data.csv'
+SUMMARY_FILE = r'D:\mpu9250_gps_distance_summary.csv'
+# ---------------------
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def log_serial_data():
+    """Reads combined GPS+IMU+Kalman data from ESP32 and logs to CSV."""
+    
+    ser = None
+    csvfile = None
+    summary_file = None
+    
+    try:
+        print("="*70)
+        print(" ESP32 NEO6M + MPU9250 DATA LOGGER")
+        print("="*70)
+        print(f"Opening serial port {COM_PORT} at {BAUD_RATE} baud...")
+        
+        ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1)
+        print("SUCCESS: Serial port connected.")
+        time.sleep(2)
+        ser.flushInput()
+        ser.flushOutput()
+        
+        print(f"Opening data file: {FILE_NAME}")
+        csvfile = open(FILE_NAME, 'w', newline='', encoding='utf-8', buffering=1)
+        csv_writer = csv.writer(csvfile)
+        
+        print(f"Opening summary file: {SUMMARY_FILE}")
+        summary_file = open(SUMMARY_FILE, 'w', newline='', encoding='utf-8', buffering=1)
+        summary_writer = csv.writer(summary_file)
+        summary_writer.writerow([
+            'session_number', 'start_time', 'end_time', 'duration_sec',
+            'distance_x_m', 'distance_y_m', 'distance_z_m',
+            'total_distance_m', 'num_samples'
+        ])
+        summary_file.flush()
+        
+        print("SUCCESS: Files ready.\n")
+        print("WAITING FOR BUTTON PRESS ON ESP32...\n")
+
+        index_counter = 0
+        header_written = False
+        is_logging = False
+        session_start = None
+        session_number = 0
+
+        start_pos_x = start_pos_y = start_pos_z = 0
+        current_pos_x = current_pos_y = current_pos_z = 0
+
+        while True:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+
+                # --- Control signals from ESP32 ---
+                if "LOGGING STARTED" in line:
+                    clear_screen()
+                    session_start = datetime.now()
+                    session_number += 1
+                    print("="*70)
+                    print(f" LOGGING SESSION #{session_number}")
+                    print("="*70)
+                    print(f"Started: {session_start.strftime('%H:%M:%S')}")
+                    print(f"Saving to: {FILE_NAME}")
+                    print("-"*70)
+                    print(f"{'Entry':<8} {'t_ms':<10} {'Lat':<10} {'Lon':<11} {'Alt':<8} "
+                          f"{'X(m)':<8} {'Y(m)':<8} {'Z(m)':<8} {'Yaw':<8} {'Pitch':<8} {'Roll':<8}")
+                    print("-"*70)
+                    is_logging = True
+                    index_counter = 0
+                    header_written = False
+                    continue
+
+                elif line.startswith("t_ms,") or "t_ms," in line:
+                    if not header_written:
+                        csv_writer.writerow(line.split(','))
+                        csvfile.flush()
+                        header_written = True
+                    continue
+
+                elif "LOGGING STOPPED" in line:
+                    session_end = datetime.now()
+                    duration = (session_end - session_start).total_seconds() if session_start else 0
+
+                    dx = current_pos_x - start_pos_x
+                    dy = current_pos_y - start_pos_y
+                    dz = current_pos_z - start_pos_z
+                    total_dist = math.sqrt(dx**2 + dy**2 + dz**2)
+
+                    summary_writer.writerow([
+                        session_number,
+                        session_start.strftime('%Y-%m-%d %H:%M:%S'),
+                        session_end.strftime('%Y-%m-%d %H:%M:%S'),
+                        round(duration, 2),
+                        round(dx, 3), round(dy, 3), round(dz, 3),
+                        round(total_dist, 3),
+                        index_counter
+                    ])
+                    summary_file.flush()
+
+                    print("-"*70)
+                    print(f"LOGGING STOPPED")
+                    print(f"Duration: {duration:.1f} sec | Samples: {index_counter}")
+                    print(f"ΔX={dx:.3f} m, ΔY={dy:.3f} m, ΔZ={dz:.3f} m, Total={total_dist:.3f} m")
+                    print("="*70)
+                    print("\nWAITING FOR BUTTON PRESS ON ESP32...\n")
+                    is_logging = False
+                    continue
+
+                # --- Data line ---
+                if is_logging and header_written:
+                    parts = line.split(',')
+                    if len(parts) == 10:  # matches t_ms,...,roll
+                        try:
+                            data_row = [float(p) for p in parts]
+                            csv_writer.writerow(data_row)
+                            csvfile.flush()
+                            index_counter += 1
+
+                            t_ms, lat, lon, alt, x, y, z, yaw, pitch, roll = data_row
+                            current_pos_x, current_pos_y, current_pos_z = x, y, z
+                            if index_counter == 1:
+                                start_pos_x, start_pos_y, start_pos_z = x, y, z
+
+                            print(f"{index_counter:<8} {t_ms:<10.0f} {lat:<10.6f} {lon:<11.6f} "
+                                  f"{alt:<8.2f} {x:<8.3f} {y:<8.3f} {z:<8.3f} "
+                                  f"{yaw:<8.2f} {pitch:<8.2f} {roll:<8.2f}")
+
+                        except ValueError:
+                            pass
+
+            time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        print("\nLogging interrupted by user.")
+    finally:
+        for f in [csvfile, summary_file]:
+            if f:
+                f.flush()
+                f.close()
+        if ser:
+            ser.close()
+        print("\nSerial port closed. Data saved successfully.")
+
+if __name__ == '__main__':
+    log_serial_data()
